@@ -22,7 +22,7 @@ The main workspace for reading and writing Modbus registers.
 
 **Writing** — Type a value in the Write Value column and click **W** to write a single row, or **Write All** to write every row that has a value entered (with confirmation). After every write, the tool automatically reads back the written registers to verify.
 
-**Binary view** — Click the **BIN** button in the toolbar to toggle the Value column between decimal and binary display. Double-click any value cell to see a popup with decimal, hex, binary, signed, and unsigned representations.
+**Binary view** — Click the **Binary** button in the toolbar to toggle the Value column between decimal and binary display. Double-click any value cell to see a popup with decimal, hex, binary, signed, and unsigned representations.
 
 **Configuration** — Save and load register configurations as JSON files. The current session auto-saves on exit and auto-loads on startup. Config files are stored next to the application.
 
