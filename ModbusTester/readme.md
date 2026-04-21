@@ -30,7 +30,7 @@ The main workspace for reading and writing Modbus registers.
 
 ## Discovery Tab
 
-Scan a network to find devices. The subnet dropdown auto-detects local interfaces and VPN/routed subnets from the routing table.
+Scan a network to find devices. The subnet dropdown auto-detects local interfaces. If you're connecting over a VPN, you'll need to manually type in the VPN router's LAN subnet.
 
 Scan methods (all optional, run in sequence):
 
@@ -39,6 +39,6 @@ Scan methods (all optional, run in sequence):
 - **EtherNet/IP** — Broadcast ListIdentity to find EIP-capable devices (local networks only)
 - **Modbus ID** — FC43 device identification on any device with port 502 open
 
-On local networks, MAC addresses are resolved via ARP and matched against a built-in vendor database (AutomationDirect, Rockwell, Siemens, Schneider, ABB, Beckhoff, and others). On remote/VPN networks, ARP and broadcasts are skipped automatically since they don't work across routed connections.
+On local networks, MAC addresses are resolved via ARP and matched against a built-in vendor database (AutomationDirect, Rockwell, Siemens, Schneider, ABB, Beckhoff, and others). On remote/VPN networks, some of this won't work.
 
 Click any discovered device to see full details. **Use in Modbus Tab** populates the connection bar and connects in one click.
