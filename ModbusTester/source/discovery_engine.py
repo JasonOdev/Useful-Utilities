@@ -120,20 +120,119 @@ def _parse_subnet(subnet_str: str) -> list[str]:
         return [f"{parts[0]}.{parts[1]}.{parts[2]}.{i}" for i in range(1, 255)]
 
 
+def _subprocess_kwargs() -> dict:
+    """Extra kwargs for subprocess.run() to suppress console windows
+    in PyInstaller --windowed builds on Windows."""
+    if platform.system().lower() == "windows":
+        si = subprocess.STARTUPINFO()
+        si.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+        si.wShowWindow = subprocess.SW_HIDE
+        return {
+            "startupinfo": si,
+            "creationflags": subprocess.CREATE_NO_WINDOW,
+        }
+    return {}
+
+
+def _arp_executable() -> str:
+    """Return full path to arp.exe on Windows to avoid PATH issues in
+    PyInstaller bundles."""
+    if platform.system().lower() == "windows":
+        import os
+        system32 = os.path.join(
+            os.environ.get("SystemRoot", r"C:\Windows"), "System32"
+        )
+        return os.path.join(system32, "arp.exe")
+    return "arp"
+
+
+def _ping_executable() -> str:
+    """Return full path to ping on Windows."""
+    if platform.system().lower() == "windows":
+        import os
+        system32 = os.path.join(
+            os.environ.get("SystemRoot", r"C:\Windows"), "System32"
+        )
+        return os.path.join(system32, "ping.exe")
+    return "ping"
+
+
 def _ping_one(ip: str, timeout_ms: int = 500) -> bool:
-    """Ping a single IP. Returns True if reachable."""
+    """Ping a single IP. Returns True if reachable.
+    Uses raw ICMP socket first (no subprocess, no window flash);
+    falls back to ping.exe if ICMP socket is unavailable."""
+
+    # ── Try raw ICMP first (no subprocess, works in PyInstaller) ─
+    try:
+        return _icmp_ping(ip, timeout_ms / 1000)
+    except PermissionError:
+        pass  # No raw socket access — fall back to ping.exe
+    except Exception:
+        pass
+
+    # ── Fallback: subprocess ping with hidden window ─────────────
     try:
         if platform.system().lower() == "windows":
-            cmd = ["ping", "-n", "1", "-w", str(timeout_ms), ip]
+            cmd = [_ping_executable(), "-n", "1", "-w", str(timeout_ms), ip]
         else:
             timeout_s = max(1, timeout_ms // 1000)
-            cmd = ["ping", "-c", "1", "-W", str(timeout_s), ip]
+            cmd = [_ping_executable(), "-c", "1", "-W", str(timeout_s), ip]
         result = subprocess.run(
-            cmd, capture_output=True, text=True, timeout=timeout_ms / 1000 + 2
+            cmd,
+            capture_output=True,
+            text=True,
+            timeout=timeout_ms / 1000 + 2,
+            **_subprocess_kwargs()
         )
         return result.returncode == 0
     except Exception:
         return False
+
+
+def _icmp_ping(ip: str, timeout: float = 0.5) -> bool:
+    """Pure-Python ICMP echo using a raw socket. No subprocess needed.
+    Requires the process to have raw socket privileges (usually fine on
+    Windows for normal users, may need root on Linux)."""
+    import struct
+    import os
+
+    # Build ICMP echo request (type=8, code=0)
+    icmp_id = os.getpid() & 0xFFFF
+    seq = 1
+    header = struct.pack("bbHHh", 8, 0, 0, icmp_id, seq)
+    payload = b"modbus_tester_ping"
+    checksum = _icmp_checksum(header + payload)
+    header = struct.pack("bbHHh", 8, 0, checksum, icmp_id, seq)
+    packet = header + payload
+
+    sock = socket.socket(socket.AF_INET, socket.SOCK_RAW, socket.IPPROTO_ICMP)
+    sock.settimeout(timeout)
+    try:
+        sock.sendto(packet, (ip, 0))
+        while True:
+            data, addr = sock.recvfrom(1024)
+            if addr[0] == ip:
+                # Validate it's an echo reply (type=0)
+                icmp_type = data[20]
+                if icmp_type == 0:
+                    return True
+    except socket.timeout:
+        return False
+    finally:
+        sock.close()
+
+
+def _icmp_checksum(data: bytes) -> int:
+    """Calculate ICMP checksum."""
+    s = 0
+    n = len(data) % 2
+    for i in range(0, len(data) - n, 2):
+        s += (data[i]) + ((data[i + 1]) << 8)
+    if n:
+        s += data[-1]
+    while s >> 16:
+        s = (s & 0xFFFF) + (s >> 16)
+    return ~s & 0xFFFF
 
 
 def _read_arp_table() -> dict[str, str]:
@@ -141,12 +240,15 @@ def _read_arp_table() -> dict[str, str]:
     arp_map = {}
     try:
         result = subprocess.run(
-            ["arp", "-a"], capture_output=True, text=True, timeout=5
+            [_arp_executable(), "-a"],
+            capture_output=True,
+            text=True,
+            timeout=5,
+            **_subprocess_kwargs()
         )
         log.debug(f"ARP raw output ({len(result.stdout)} chars):\n{result.stdout[:500]}")
         for line in result.stdout.splitlines():
             # Windows: "  192.168.1.1          00-90-e8-3c-a1-02     dynamic"
-            # Also match MACs with colons or dashes
             m = re.search(
                 r'(\d+\.\d+\.\d+\.\d+)\s+'
                 r'([\da-fA-F]{2}[:-][\da-fA-F]{2}[:-][\da-fA-F]{2}[:-]'
@@ -176,16 +278,15 @@ def _read_arp_table() -> dict[str, str]:
 
 
 def _arp_lookup_single(ip: str) -> str:
-    """Try to get MAC for a single IP via arp command. Fallback method."""
+    """Try to get MAC for a single IP via arp command."""
     try:
-        if platform.system().lower() == "windows":
-            result = subprocess.run(
-                ["arp", "-a", ip], capture_output=True, text=True, timeout=3
-            )
-        else:
-            result = subprocess.run(
-                ["arp", "-n", ip], capture_output=True, text=True, timeout=3
-            )
+        result = subprocess.run(
+            [_arp_executable(), "-a", ip],
+            capture_output=True,
+            text=True,
+            timeout=3,
+            **_subprocess_kwargs()
+        )
         m = re.search(
             r'([\da-fA-F]{2}[:-][\da-fA-F]{2}[:-][\da-fA-F]{2}[:-]'
             r'[\da-fA-F]{2}[:-][\da-fA-F]{2}[:-][\da-fA-F]{2})',
