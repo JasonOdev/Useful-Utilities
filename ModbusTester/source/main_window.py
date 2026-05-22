@@ -19,7 +19,7 @@ from PySide6.QtGui import QFont, QColor, QTextCursor
 from modbus_client import (
     ModbusTcpBackend, compute_address_str, is_writable,
     REG_TYPES, DATA_TYPES, REG_COUNTS, BYTE_ORDER_LABELS,
-    _decode_registers,
+    _decode_registers, regs_to_bytes_ordered,
 )
 from app_config import (
     AppConfig, ConnectionConfig, RegisterEntry,
@@ -37,16 +37,17 @@ COL_LABEL    = 1
 COL_REGTYPE  = 2
 COL_OFFSET   = 3
 COL_DATATYPE = 4
-COL_ADDRESS  = 5
-COL_VALUE    = 6
-COL_STATUS   = 7
-COL_WRITE    = 8
-COL_WRITEBTN = 9
-NUM_COLS     = 10
+COL_REGCOUNT = 5   # ASCII register count (shown only for ASCII rows)
+COL_ADDRESS  = 6
+COL_VALUE    = 7
+COL_STATUS   = 8
+COL_WRITE    = 9
+COL_WRITEBTN = 10
+NUM_COLS     = 11
 
 COLUMN_HEADERS = [
-    "", "Label", "Register Type", "Offset", "Data Type",
-    "Address", "Value", "", "Write Value", "",
+    "", "Label", "Register Type", "Entry", "Data Type",
+    "Regs", "Address", "Value", "", "Write Value", "",
 ]
 
 
@@ -80,7 +81,7 @@ class _ReadWorker(QObject):
     def __init__(self, backend, rows_data, byte_order):
         super().__init__()
         self.backend = backend
-        self.rows_data = rows_data     # [(row_idx, reg_type, offset, data_type), ...]
+        self.rows_data = rows_data     # [(row_idx, reg_type, offset, data_type, reg_count), ...]
         self.byte_order = byte_order
 
     def run(self):
@@ -88,11 +89,25 @@ class _ReadWorker(QObject):
         _log = logging.getLogger("modbus_tester")
         t0 = time.perf_counter()
 
-        # Group by register type
+        # Separate ASCII rows (read individually) from coalesced numeric rows
         from collections import defaultdict
+        ascii_rows = [(ri, rt, off, dt, rc) for ri, rt, off, dt, rc in self.rows_data if dt == "ASCII"]
+        numeric_rows = [(ri, rt, off, dt, rc) for ri, rt, off, dt, rc in self.rows_data if dt != "ASCII"]
+
+        # ── ASCII: one request per row ──────────────────────────
+        for row_idx, reg_type, offset, data_type, reg_count in ascii_rows:
+            try:
+                raw = self.backend.read_bulk(reg_type, offset, reg_count)
+                regs = list(raw)
+                val = _decode_registers(regs, "ASCII", self.byte_order, reg_count=reg_count)
+                self.row_result.emit(row_idx, val, regs, "")
+            except Exception as exc:
+                self.row_result.emit(row_idx, None, None, str(exc))
+
+        # ── Numeric: coalesce contiguous registers ──────────────
         groups = defaultdict(list)
-        for row_idx, reg_type, offset, data_type in self.rows_data:
-            groups[reg_type].append((row_idx, offset, data_type))
+        for row_idx, reg_type, offset, data_type, reg_count in numeric_rows:
+            groups[reg_type].append((row_idx, offset, data_type, reg_count))
 
         for reg_type, items in groups.items():
             items.sort(key=lambda x: x[1])  # sort by offset
@@ -104,15 +119,15 @@ class _ReadWorker(QObject):
             r_items = [items[0]]
 
             for item in items[1:]:
-                _, offset, data_type = item
-                reg_count = REG_COUNTS.get(data_type, 1)
+                _, offset, data_type, reg_count = item
+                reg_count_val = REG_COUNTS.get(data_type, 1)
                 if offset == r_end:
-                    r_end = offset + reg_count
+                    r_end = offset + reg_count_val
                     r_items.append(item)
                 else:
                     ranges.append((r_start, r_end - r_start, list(r_items)))
                     r_start = offset
-                    r_end = offset + reg_count
+                    r_end = offset + reg_count_val
                     r_items = [item]
             ranges.append((r_start, r_end - r_start, list(r_items)))
 
@@ -128,7 +143,7 @@ class _ReadWorker(QObject):
             for start, count, items_in_range in ranges:
                 try:
                     raw = self.backend.read_bulk(reg_type, start, count)
-                    for row_idx, offset, data_type in items_in_range:
+                    for row_idx, offset, data_type, _ in items_in_range:
                         rc = REG_COUNTS.get(data_type, 1)
                         pos = offset - start
                         if reg_type in ("coil", "discrete"):
@@ -140,7 +155,7 @@ class _ReadWorker(QObject):
                                                     self.byte_order)
                         self.row_result.emit(row_idx, val, raw_regs, "")
                 except Exception as exc:
-                    for row_idx, _, _ in items_in_range:
+                    for row_idx, _, _, _ in items_in_range:
                         self.row_result.emit(row_idx, None, None, str(exc))
 
         elapsed = (time.perf_counter() - t0) * 1000
@@ -188,6 +203,7 @@ class MainWindow(QMainWindow):
         self._show_binary = False
         self._raw_values = {}       # row → list[int] raw register values
         self._decoded_values = {}   # row → decoded Python value
+        self._raw_offsets = {}      # row → zero-based wire offset (source of truth)
 
         # Central widget — tabbed layout
         central = QWidget()
@@ -324,7 +340,8 @@ class MainWindow(QMainWindow):
             lay.addWidget(widget)
 
         self._host_edit = QLineEdit("192.168.1.1")
-        self._host_edit.setFixedWidth(140)
+        self._host_edit.setFixedWidth(130)
+        self._host_edit.setFixedHeight(30)
         self._host_edit.setPlaceholderText("IP address")
         _add_field("Host", self._host_edit)
 
@@ -333,6 +350,7 @@ class MainWindow(QMainWindow):
         self._port_spin.setRange(1, 65535)
         self._port_spin.setValue(502)
         self._port_spin.setFixedWidth(60)
+        self._port_spin.setFixedHeight(30)
         _add_field("Port", self._port_spin)
 
         self._unit_spin = QSpinBox()
@@ -340,13 +358,27 @@ class MainWindow(QMainWindow):
         self._unit_spin.setRange(0, 255)
         self._unit_spin.setValue(1)
         self._unit_spin.setFixedWidth(60)
+        self._unit_spin.setFixedHeight(30)
         _add_field("Unit ID", self._unit_spin)
 
         self._byte_order_combo = QComboBox()
         for key, label in BYTE_ORDER_LABELS.items():
             self._byte_order_combo.addItem(label, key)
-        self._byte_order_combo.setFixedWidth(200)
+        self._byte_order_combo.setFixedWidth(220)
+        self._byte_order_combo.setFixedHeight(30)
         _add_field("Byte Order", self._byte_order_combo)
+
+        self._offset_mode_combo = QComboBox()
+        self._offset_mode_combo.addItem("Register # (1-based)", "register")
+        self._offset_mode_combo.addItem("Offset (0-based)", "offset")
+        self._offset_mode_combo.setFixedWidth(160)
+        self._offset_mode_combo.setFixedHeight(30)
+        self._offset_mode_combo.setToolTip(
+            "Register #: enter the register number as shown in documentation (e.g. 900 → wire offset 899)\n"
+            "Offset: enter the zero-based wire offset directly"
+        )
+        self._offset_mode_combo.currentIndexChanged.connect(self._on_offset_mode_changed)
+        _add_field("Entry Mode", self._offset_mode_combo)
 
         lay.addStretch()
 
@@ -362,11 +394,46 @@ class MainWindow(QMainWindow):
 
         # Auto-reconnect when host or port changes while connected
         self._host_edit.editingFinished.connect(self._on_connection_params_changed)
-        self._port_spin.valueChanged.connect(self._on_connection_params_changed)
 
         self._root.addWidget(grp)
 
+    def _offset_mode(self) -> str:
+        """Current offset entry mode: 'register' (1-based) or 'offset' (0-based)."""
+        return self._offset_mode_combo.currentData()
+
+    def _display_to_wire(self, display_val: int) -> int:
+        """Convert a user-entered value to a zero-based wire offset."""
+        if self._offset_mode() == "register":
+            return max(0, display_val - 1)
+        return display_val
+
+    def _wire_to_display(self, wire_offset: int) -> int:
+        """Convert a zero-based wire offset to the user-facing display value."""
+        if self._offset_mode() == "register":
+            return wire_offset + 1
+        return wire_offset
+
+    def _on_offset_mode_changed(self):
+        """Re-display every offset cell when the entry mode changes."""
+        mode = self._offset_mode()
+        # Update column header
+        self._table.setHorizontalHeaderItem(
+            COL_OFFSET,
+            QTableWidgetItem("Register #" if mode == "register" else "Offset")
+        )
+        # Re-render offset cells using stored wire offsets
+        self._table.cellChanged.disconnect(self._on_cell_changed)
+        for r in range(self._table.rowCount()):
+            item = self._table.item(r, COL_OFFSET)
+            if not item:
+                continue
+            wire = self._raw_offsets.get(r, 0)
+            item.setText(str(self._wire_to_display(wire)))
+            self._update_address(r)
+        self._table.cellChanged.connect(self._on_cell_changed)
+
     # ── Toolbar ─────────────────────────────────────────────────
+
     def _build_toolbar(self):
         bar = QWidget()
         lay = QHBoxLayout(bar)
@@ -465,29 +532,31 @@ class MainWindow(QMainWindow):
         self._table.verticalHeader().hide()
 
         header = self._table.horizontalHeader()
-        header.setSectionResizeMode(COL_ENABLE,   QHeaderView.Fixed)
-        header.setSectionResizeMode(COL_LABEL,    QHeaderView.Stretch)
-        header.setSectionResizeMode(COL_REGTYPE,  QHeaderView.Fixed)
-        header.setSectionResizeMode(COL_OFFSET,   QHeaderView.Fixed)
-        header.setSectionResizeMode(COL_DATATYPE, QHeaderView.Fixed)
-        header.setSectionResizeMode(COL_ADDRESS,  QHeaderView.Fixed)
-        header.setSectionResizeMode(COL_VALUE,    QHeaderView.Fixed)
-        header.setSectionResizeMode(COL_STATUS,   QHeaderView.Fixed)
-        header.setSectionResizeMode(COL_WRITE,    QHeaderView.Fixed)
-        header.setSectionResizeMode(COL_WRITEBTN, QHeaderView.Fixed)
+        header.setSectionResizeMode(COL_ENABLE,    QHeaderView.Fixed)
+        header.setSectionResizeMode(COL_LABEL,     QHeaderView.Stretch)
+        header.setSectionResizeMode(COL_REGTYPE,   QHeaderView.Fixed)
+        header.setSectionResizeMode(COL_OFFSET,    QHeaderView.Fixed)
+        header.setSectionResizeMode(COL_DATATYPE,  QHeaderView.Fixed)
+        header.setSectionResizeMode(COL_REGCOUNT,  QHeaderView.Fixed)
+        header.setSectionResizeMode(COL_ADDRESS,   QHeaderView.Fixed)
+        header.setSectionResizeMode(COL_VALUE,     QHeaderView.Fixed)
+        header.setSectionResizeMode(COL_STATUS,    QHeaderView.Fixed)
+        header.setSectionResizeMode(COL_WRITE,     QHeaderView.Fixed)
+        header.setSectionResizeMode(COL_WRITEBTN,  QHeaderView.Fixed)
 
-        self._table.setColumnWidth(COL_ENABLE,   36)
-        self._table.setColumnWidth(COL_REGTYPE,  170)
-        self._table.setColumnWidth(COL_OFFSET,   70)
-        self._table.setColumnWidth(COL_DATATYPE, 110)
-        self._table.setColumnWidth(COL_ADDRESS,  130)
-        self._table.setColumnWidth(COL_VALUE,    260)
-        self._table.setColumnWidth(COL_STATUS,   30)
-        self._table.setColumnWidth(COL_WRITE,    120)
-        self._table.setColumnWidth(COL_WRITEBTN, 50)
+        self._table.setColumnWidth(COL_ENABLE,    34)
+        self._table.setColumnWidth(COL_REGTYPE,   175)
+        self._table.setColumnWidth(COL_OFFSET,    70)
+        self._table.setColumnWidth(COL_DATATYPE,  100)
+        self._table.setColumnWidth(COL_REGCOUNT,  50)
+        self._table.setColumnWidth(COL_ADDRESS,   110)
+        self._table.setColumnWidth(COL_VALUE,     260)
+        self._table.setColumnWidth(COL_STATUS,    30)
+        self._table.setColumnWidth(COL_WRITE,     100)
+        self._table.setColumnWidth(COL_WRITEBTN,  50)
 
         self._table.cellChanged.connect(self._on_cell_changed)
-        self._table.cellDoubleClicked.connect(self._on_value_double_click)
+        self._table.cellClicked.connect(self._on_cell_clicked)
         self._splitter.addWidget(self._table)
 
     # ── Log Panel ───────────────────────────────────────────────
@@ -604,8 +673,11 @@ class MainWindow(QMainWindow):
         rt_combo.currentIndexChanged.connect(lambda _, r=row: self._on_row_type_changed(r))
         self._table.setCellWidget(row, COL_REGTYPE, rt_combo)
 
-        # Offset
-        offset_item = QTableWidgetItem(str(e.offset))
+        # Offset — displayed as register# or wire offset depending on mode
+        wire_offset = e.offset  # always stored as zero-based wire offset
+        self._raw_offsets[row] = wire_offset
+        display_val = self._wire_to_display(wire_offset)
+        offset_item = QTableWidgetItem(str(display_val))
         offset_item.setTextAlignment(Qt.AlignCenter)
         self._table.setItem(row, COL_OFFSET, offset_item)
 
@@ -614,8 +686,24 @@ class MainWindow(QMainWindow):
         dt_combo.addItems(DATA_TYPES)
         dt_idx = DATA_TYPES.index(e.data_type) if e.data_type in DATA_TYPES else 0
         dt_combo.setCurrentIndex(dt_idx)
-        dt_combo.currentIndexChanged.connect(lambda _, r=row: self._update_address(r))
+        dt_combo.currentIndexChanged.connect(lambda _, r=row: self._on_datatype_changed(r))
         self._table.setCellWidget(row, COL_DATATYPE, dt_combo)
+
+        # Reg Count spinbox
+        # For ASCII: editable, defaults to 1. For others: shows actual count, read-only.
+        dt_for_count = e.data_type
+        if dt_for_count == "ASCII":
+            initial_rc = getattr(e, "reg_count", 1)
+        else:
+            initial_rc = REG_COUNTS.get(dt_for_count, 1)
+        rc_spin = QSpinBox()
+        rc_spin.setButtonSymbols(QSpinBox.NoButtons)
+        rc_spin.setRange(1, 125)
+        rc_spin.setValue(initial_rc)
+        rc_spin.setAlignment(Qt.AlignCenter)
+        rc_spin.setToolTip("Number of registers to read (editable for ASCII only)")
+        rc_spin.valueChanged.connect(lambda _, r=row: self._update_address(r))
+        self._table.setCellWidget(row, COL_REGCOUNT, rc_spin)
 
         # Address (read-only)
         addr_item = QTableWidgetItem("")
@@ -656,14 +744,49 @@ class MainWindow(QMainWindow):
         self._table.setCellWidget(row, COL_WRITEBTN, w_widget)
 
         self._update_address(row)
+        self._update_regcount_state(row)
 
     def _on_row_type_changed(self, row):
         self._update_address(row)
         self._update_write_button_state(row)
 
+    def _on_datatype_changed(self, row):
+        """Called when data type combo changes — update address and Regs column visibility."""
+        self._update_address(row)
+        self._update_regcount_state(row)
+
+    def _update_regcount_state(self, row):
+        """Enable/style the Regs spinbox for ASCII; show correct fixed count for others."""
+        dt_combo = self._table.cellWidget(row, COL_DATATYPE)
+        rc_spin = self._table.cellWidget(row, COL_REGCOUNT)
+        if not dt_combo or not rc_spin:
+            return
+        data_type = dt_combo.currentData() or dt_combo.currentText()
+        is_ascii = data_type == "ASCII"
+        if is_ascii:
+            rc_spin.setEnabled(True)
+            rc_spin.setReadOnly(False)
+            rc_spin.setStyleSheet("")
+        else:
+            # Show the actual register count for this type, grayed and non-editable
+            actual = REG_COUNTS.get(data_type, 1)
+            rc_spin.blockSignals(True)
+            rc_spin.setValue(actual)
+            rc_spin.blockSignals(False)
+            rc_spin.setEnabled(False)
+            rc_spin.setStyleSheet(
+                f"color: {COLORS['text_dim']}; background: {COLORS['surface_alt']};"
+            )
+
     def _on_cell_changed(self, row, col):
         """Recalculate address when the user edits the offset field."""
         if col == COL_OFFSET:
+            item = self._table.item(row, COL_OFFSET)
+            try:
+                display_val = int(item.text()) if item else 0
+            except ValueError:
+                display_val = 0
+            self._raw_offsets[row] = self._display_to_wire(display_val)
             self._update_address(row)
 
     def _update_address(self, row):
@@ -674,14 +797,18 @@ class MainWindow(QMainWindow):
         if not addr_item:
             return  # row still being built
         reg_type = rt_combo.currentData()
-        try:
-            offset = int(self._table.item(row, COL_OFFSET).text())
-        except (ValueError, AttributeError):
-            offset = 0
+
+        # Use the stored wire offset (source of truth)
+        offset = self._raw_offsets.get(row, 0)
 
         dt_combo = self._table.cellWidget(row, COL_DATATYPE)
         data_type = dt_combo.currentData() or dt_combo.currentText() if dt_combo else "UINT16"
-        count = REG_COUNTS.get(data_type, 1)
+
+        if data_type == "ASCII":
+            rc_spin = self._table.cellWidget(row, COL_REGCOUNT)
+            count = rc_spin.value() if rc_spin else 1
+        else:
+            count = REG_COUNTS.get(data_type, 1)
 
         addr_str = compute_address_str(reg_type, offset)
         if count > 1:
@@ -707,6 +834,7 @@ class MainWindow(QMainWindow):
             self._table.removeRow(r)
             self._raw_values.pop(r, None)
             self._decoded_values.pop(r, None)
+            self._raw_offsets.pop(r, None)
 
     def _get_row_checkbox(self, row) -> QCheckBox | None:
         w = self._table.cellWidget(row, COL_ENABLE)
@@ -715,15 +843,15 @@ class MainWindow(QMainWindow):
     def _get_row_entry(self, row) -> dict:
         rt_combo = self._table.cellWidget(row, COL_REGTYPE)
         dt_combo = self._table.cellWidget(row, COL_DATATYPE)
-        try:
-            offset = int(self._table.item(row, COL_OFFSET).text())
-        except (ValueError, AttributeError):
-            offset = 0
+        rc_spin = self._table.cellWidget(row, COL_REGCOUNT)
+        offset = self._raw_offsets.get(row, 0)
+        data_type = (dt_combo.currentData() or dt_combo.currentText()) if dt_combo else "UINT16"
+        reg_count = rc_spin.value() if rc_spin else 1
         return {
             "reg_type":  rt_combo.currentData() if rt_combo else "holding",
             "offset":    offset,
-            "data_type": (dt_combo.currentData() or dt_combo.currentText())
-                         if dt_combo else "UINT16",
+            "data_type": data_type,
+            "reg_count": reg_count,
         }
 
     # ═══════════════════════════════════════════════════════════
@@ -743,10 +871,13 @@ class MainWindow(QMainWindow):
         rt_combo.setCurrentIndex(3)
         layout.addWidget(rt_combo, 0, 1)
 
-        layout.addWidget(QLabel("Start Offset:"), 1, 0)
+        mode = self._offset_mode()
+        start_label = "Start Register #:" if mode == "register" else "Start Offset:"
+        layout.addWidget(QLabel(start_label), 1, 0)
         start_spin = QSpinBox()
         start_spin.setButtonSymbols(QSpinBox.NoButtons)
-        start_spin.setRange(0, 65535)
+        start_spin.setRange(1 if mode == "register" else 0, 65535)
+        start_spin.setValue(1 if mode == "register" else 0)
         layout.addWidget(start_spin, 1, 1)
 
         layout.addWidget(QLabel("Count:"), 2, 0)
@@ -777,7 +908,8 @@ class MainWindow(QMainWindow):
 
         def accept():
             reg_type = rt_combo.currentData()
-            start = start_spin.value()
+            start_display = start_spin.value()
+            start_wire = self._display_to_wire(start_display)
             count = count_spin.value()
             data_type = dt_combo.currentText()
             prefix = prefix_edit.text().strip()
@@ -792,13 +924,13 @@ class MainWindow(QMainWindow):
                 )
 
             for i in range(actual):
-                offset = start + i * reg_size
-                label = f"{prefix}_{offset}" if prefix else ""
+                wire_offset = start_wire + i * reg_size
+                label = f"{prefix}_{wire_offset + 1}" if prefix else ""
                 self._add_row(RegisterEntry(
                     label=label, reg_type=reg_type,
-                    offset=offset, data_type=data_type,
+                    offset=wire_offset, data_type=data_type,
                 ))
-            log.info(f"Added {actual} bulk rows: {reg_type} start={start} "
+            log.info(f"Added {actual} bulk rows: {reg_type} start={start_wire} "
                      f"type={data_type} stride={reg_size}")
             dlg.accept()
 
@@ -904,9 +1036,33 @@ class MainWindow(QMainWindow):
                 rows.append(r)
         return rows
 
+    def _ensure_connected(self) -> bool:
+        """Connect using the current UI params if not already connected.
+        Returns True if connected (or already was). Updates UI on success/failure."""
+        if self.backend.is_connected():
+            return True
+        host = self._host_edit.text().strip()
+        port = self._port_spin.value()
+        uid = self._unit_spin.value()
+        self._statusbar.showMessage(f"Connecting to {host}:{port}…")
+        QApplication.processEvents()   # let the message paint before blocking connect
+        try:
+            ok = self.backend.connect(host=host, port=port, unit_id=uid)
+            self._set_connection_ui(ok)
+            if ok:
+                self._statusbar.clearMessage()
+            else:
+                self._statusbar.showMessage(
+                    f"Auto-connect failed: {host}:{port}", 4000)
+            return ok
+        except Exception as exc:
+            log.error(f"Auto-connect exception: {exc}")
+            self._set_connection_ui(False)
+            self._statusbar.showMessage(f"Auto-connect error: {exc}", 4000)
+            return False
+
     def _do_read_selected(self):
-        if not self.backend.is_connected():
-            self._statusbar.showMessage("Not connected", 3000)
+        if not self._ensure_connected():
             return
         if self._read_thread and self._read_thread.isRunning():
             return
@@ -920,7 +1076,8 @@ class MainWindow(QMainWindow):
         rows_data = []
         for r in rows:
             info = self._get_row_entry(r)
-            rows_data.append((r, info["reg_type"], info["offset"], info["data_type"]))
+            rows_data.append((r, info["reg_type"], info["offset"],
+                               info["data_type"], info["reg_count"]))
             self._table.item(r, COL_STATUS).setText("…")
             self._table.item(r, COL_STATUS).setForeground(QColor(COLORS["yellow"]))
 
@@ -959,6 +1116,9 @@ class MainWindow(QMainWindow):
 
     def _format_value(self, row, value, raw_regs):
         """Format a value for the Value column based on the display mode."""
+        # ASCII strings are always shown as text, binary toggle doesn't apply
+        if isinstance(value, str):
+            return f'"{value}"'
         if self._show_binary:
             return self._format_binary(raw_regs)
         if isinstance(value, bool):
@@ -967,9 +1127,8 @@ class MainWindow(QMainWindow):
             return f"{value:.4f}"
         return str(value)
 
-    @staticmethod
-    def _format_binary(raw_regs):
-        """Format raw 16-bit register values as a binary string."""
+    def _format_binary(self, raw_regs):
+        """Format register values as binary string in byte-order-correct word sequence."""
         if not raw_regs:
             return ""
         if len(raw_regs) == 1:
@@ -977,8 +1136,25 @@ class MainWindow(QMainWindow):
             if v in (0, 1):
                 return str(v)
             return f"{v:016b}"
-        # Multi-register: concatenate
-        return " ".join(f"{r:016b}" for r in raw_regs)
+        # Reorder words according to byte order so display matches the decoded value
+        byte_order = self._byte_order_combo.currentData()
+        ordered = self._reorder_regs_for_display(raw_regs, byte_order)
+        return " ".join(f"{r:016b}" for r in ordered)
+
+    @staticmethod
+    def _reorder_regs_for_display(raw_regs: list, byte_order: str) -> list:
+        """Return register words in the order that corresponds to the decoded value's bits.
+        raw_regs come off the wire in big-endian word order (reg[0] = high word for big-endian).
+        For mid_big / word-swap, the low word arrives first, so we reverse for display."""
+        if len(raw_regs) != 2:
+            return raw_regs
+        if byte_order in ("big", "mid_little"):
+            # High word first — already the natural bit order
+            return raw_regs
+        elif byte_order in ("little", "mid_big"):
+            # Low word arrived first — swap for MSB-left display
+            return [raw_regs[1], raw_regs[0]]
+        return raw_regs
 
     def _toggle_binary_view(self):
         """Toggle all Value cells between decimal and binary display."""
@@ -990,32 +1166,57 @@ class MainWindow(QMainWindow):
                 )
                 self._table.item(row, COL_VALUE).setText(display)
 
-    def _on_value_double_click(self, row, col):
-        """Show a popup with both decimal and binary representations."""
-        if col != COL_VALUE:
-            return
+    def _on_cell_clicked(self, row, col):
+        """Single-click popup for Value column (detail) and Address column (address info)."""
+        if col == COL_VALUE:
+            self._show_value_detail(row)
+        elif col == COL_ADDRESS:
+            self._show_address_detail(row)
+
+    def _show_value_detail(self, row: int):
+        """Show a non-beeping detail popup for the value cell."""
         if row not in self._raw_values:
             return
 
+        import struct as _struct
         raw = self._raw_values[row]
         val = self._decoded_values.get(row)
+        byte_order = self._byte_order_combo.currentData()
 
         lines = []
+
+        # Decoded value
         if val is not None:
-            if isinstance(val, bool):
-                lines.append(f"Decimal:  {'1' if val else '0'}  ({val})")
+            if isinstance(val, str):
+                lines.append(f"String:   \"{val}\"")
+            elif isinstance(val, bool):
+                lines.append(f"Value:    {'TRUE (1)' if val else 'FALSE (0)'}")
             elif isinstance(val, float):
                 lines.append(f"Decimal:  {val}")
+                lines.append(f"          {val:.6e}")
             else:
                 lines.append(f"Decimal:  {val}")
+                if isinstance(val, int) and not isinstance(val, bool):
+                    lines.append(f"Hex:      0x{val & 0xFFFFFFFF:08X}")
 
-        if raw:
-            lines.append(f"Hex:      {' '.join(f'0x{r:04X}' for r in raw)}")
-            lines.append(f"Binary:   {' '.join(f'{r:016b}' for r in raw)}")
+        if raw and not isinstance(val, str):
+            lines.append("")
+            lines.append(f"Raw regs (wire order):")
+            lines.append(f"  Hex:    {' '.join(f'0x{r:04X}' for r in raw)}")
+            lines.append(f"  Binary: {' '.join(f'{r:016b}' for r in raw)}")
+
+            if len(raw) == 2:
+                ordered = self._reorder_regs_for_display(raw, byte_order)
+                if ordered != raw:
+                    lines.append("")
+                    lines.append(f"Reordered ({byte_order}):")
+                    lines.append(f"  Hex:    {' '.join(f'0x{r:04X}' for r in ordered)}")
+                    lines.append(f"  Binary: {' '.join(f'{r:016b}' for r in ordered)}")
+
             if len(raw) == 1:
+                lines.append("")
                 lines.append(f"Unsigned: {raw[0]}")
-                import struct
-                signed = struct.unpack('>h', struct.pack('>H', raw[0]))[0]
+                signed = _struct.unpack('>h', _struct.pack('>H', raw[0]))[0]
                 lines.append(f"Signed:   {signed}")
 
         info = self._get_row_entry(row)
@@ -1024,12 +1225,67 @@ class MainWindow(QMainWindow):
         addr = compute_address_str(info["reg_type"], info["offset"])
         title = f"{label} ({addr})" if label else addr
 
-        QMessageBox.information(
-            self, f"Register Detail — {title}",
-            "\n".join(lines),
-        )
+        dlg = QDialog(self)
+        dlg.setWindowTitle(f"Value — {title}")
+        dlg.setWindowFlag(Qt.WindowContextHelpButtonHint, False)
+        layout = QVBoxLayout(dlg)
+        layout.setSpacing(4)
+        text = QTextEdit()
+        text.setReadOnly(True)
+        text.setFont(QFont("Consolas", 10))
+        text.setPlainText("\n".join(lines))
+        text.setFixedSize(380, 220)
+        layout.addWidget(text)
+        btn = QPushButton("Close")
+        btn.clicked.connect(dlg.accept)
+        btn.setDefault(True)
+        layout.addWidget(btn, alignment=Qt.AlignRight)
+        dlg.exec()
 
-        self._status_error_label.setText(f"Errors: {self._error_count}")
+    def _show_address_detail(self, row: int):
+        """Show a popup with offset and address in decimal and hex."""
+        info = self._get_row_entry(row)
+        offset = info["offset"]
+        reg_type = info["reg_type"]
+        reg_type_label = REG_TYPES.get(reg_type, {}).get("label", reg_type)
+
+        # Modicon 5-digit address (1-based, prefixed)
+        modicon = compute_address_str(reg_type, offset)
+
+        lines = [
+            f"Register type:  {reg_type_label}",
+            "",
+            f"Wire offset (0-based):",
+            f"  Decimal:  {offset}",
+            f"  Hex:      0x{offset:04X}",
+            "",
+            f"Register # (1-based):",
+            f"  Decimal:  {offset + 1}",
+            f"  Hex:      0x{(offset + 1):04X}",
+            "",
+            f"Modicon address: {modicon}",
+        ]
+
+        label_item = self._table.item(row, COL_LABEL)
+        label = label_item.text() if label_item else ""
+        title = f"Address — {label}" if label else f"Address — {modicon}"
+
+        dlg = QDialog(self)
+        dlg.setWindowTitle(title)
+        dlg.setWindowFlag(Qt.WindowContextHelpButtonHint, False)
+        layout = QVBoxLayout(dlg)
+        layout.setSpacing(4)
+        text = QTextEdit()
+        text.setReadOnly(True)
+        text.setFont(QFont("Consolas", 10))
+        text.setPlainText("\n".join(lines))
+        text.setFixedSize(300, 220)
+        layout.addWidget(text)
+        btn = QPushButton("Close")
+        btn.clicked.connect(dlg.accept)
+        btn.setDefault(True)
+        layout.addWidget(btn, alignment=Qt.AlignRight)
+        dlg.exec()
 
     def _on_read_finished(self, elapsed_ms: float, thread: QThread):
         self._last_scan_ms = elapsed_ms
@@ -1046,8 +1302,7 @@ class MainWindow(QMainWindow):
             self._start_cyclic()
 
     def _start_cyclic(self):
-        if not self.backend.is_connected():
-            self._statusbar.showMessage("Not connected", 3000)
+        if not self._ensure_connected():
             return
         interval = self._interval_spin.value()
         log.info(f"Cyclic polling STARTED — interval {interval} ms")
@@ -1157,7 +1412,8 @@ class MainWindow(QMainWindow):
         rows_data = []
         for r in rows:
             info = self._get_row_entry(r)
-            rows_data.append((r, info["reg_type"], info["offset"], info["data_type"]))
+            rows_data.append((r, info["reg_type"], info["offset"],
+                               info["data_type"], info["reg_count"]))
 
         log.info(f"─── Verify read-back: {len(rows)} row(s) after write ───")
 
@@ -1183,22 +1439,21 @@ class MainWindow(QMainWindow):
             unit_id=self._unit_spin.value(),
             byte_order=self._byte_order_combo.currentData(),
             scan_interval_ms=self._interval_spin.value(),
+            offset_mode=self._offset_mode_combo.currentData(),
         )
         entries = []
         for r in range(self._table.rowCount()):
             cb = self._get_row_checkbox(r)
             rt_combo = self._table.cellWidget(r, COL_REGTYPE)
             dt_combo = self._table.cellWidget(r, COL_DATATYPE)
-            try:
-                offset = int(self._table.item(r, COL_OFFSET).text())
-            except (ValueError, AttributeError):
-                offset = 0
+            rc_spin = self._table.cellWidget(r, COL_REGCOUNT)
             entries.append(RegisterEntry(
                 label=self._table.item(r, COL_LABEL).text() if self._table.item(r, COL_LABEL) else "",
                 reg_type=rt_combo.currentData() if rt_combo else "holding",
-                offset=offset,
+                offset=self._raw_offsets.get(r, 0),   # always save as wire offset
                 data_type=(dt_combo.currentData() or dt_combo.currentText()) if dt_combo else "UINT16",
                 enabled=cb.isChecked() if cb else True,
+                reg_count=rc_spin.value() if rc_spin else 1,
             ))
         return AppConfig(connection=conn, entries=entries)
 
@@ -1210,12 +1465,21 @@ class MainWindow(QMainWindow):
         if idx >= 0:
             self._byte_order_combo.setCurrentIndex(idx)
         self._interval_spin.setValue(cfg.connection.scan_interval_ms)
+        idx = self._offset_mode_combo.findData(cfg.connection.offset_mode)
+        if idx >= 0:
+            # Block the signal so mode change doesn't try to re-render before rows exist
+            self._offset_mode_combo.blockSignals(True)
+            self._offset_mode_combo.setCurrentIndex(idx)
+            self._offset_mode_combo.blockSignals(False)
 
         self._table.setRowCount(0)
         self._raw_values.clear()
         self._decoded_values.clear()
+        self._raw_offsets.clear()
         for entry in cfg.entries:
             self._add_row(entry)
+        # Update column header to match restored mode
+        self._on_offset_mode_changed()
 
     def _save_config_dialog(self):
         path, _ = QFileDialog.getSaveFileName(
@@ -1248,4 +1512,6 @@ class MainWindow(QMainWindow):
             log.info(f"Auto-saved to {AUTO_SAVE_PATH}")
         except Exception as exc:
             log.error(f"Auto-save failed: {exc}")
-        event.accept()
+        finally:
+            event.accept()
+

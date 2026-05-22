@@ -91,6 +91,9 @@ def _regs_hex(regs: list[int]) -> str:
 REG_COUNTS = {
     "BOOL": 1, "UINT16": 1, "INT16": 1,
     "UINT32": 2, "INT32": 2, "FLOAT32": 2,
+    # ASCII is variable-length; reg_count comes from the row config, not here.
+    # A sentinel of 1 is stored so callers that need a fallback don't crash.
+    "ASCII": 1,
 }
 
 DATA_TYPES = list(REG_COUNTS.keys())
@@ -101,6 +104,11 @@ REG_TYPES = {
     "input":    {"prefix": "3", "label": "Input Register (3x)",   "writable": False, "fc_read": 4, "fc_write": None},
     "holding":  {"prefix": "4", "label": "Holding Register (4x)", "writable": True,  "fc_read": 3, "fc_write": 6},
 }
+
+
+def regs_to_bytes_ordered(regs: list[int], byte_order: str) -> bytes:
+    """Public wrapper around _regs_to_bytes for use in the GUI."""
+    return _regs_to_bytes(regs, byte_order)
 
 
 def compute_address_str(reg_type: str, offset: int) -> str:
@@ -115,7 +123,15 @@ def is_writable(reg_type: str) -> bool:
 # ── Decode / encode helpers ─────────────────────────────────────
 
 def _decode_registers(registers: list[int], data_type: str,
-                      byte_order: str):
+                      byte_order: str, reg_count: int = 0):
+    if data_type == "ASCII":
+        # Each 16-bit register holds two ASCII bytes (high byte first).
+        # reg_count overrides len(registers) if provided.
+        count = reg_count if reg_count > 0 else len(registers)
+        raw = b"".join(struct.pack(">H", r) for r in registers[:count])
+        # Decode, stopping at the first null byte.
+        text = raw.split(b"\x00")[0].decode("ascii", errors="replace")
+        return text
     if data_type == "UINT16":
         return registers[0]
     elif data_type == "INT16":
@@ -214,12 +230,14 @@ class ModbusTcpBackend(CommunicationBackend):
             return False
 
     # ── read ────────────────────────────────────────────────────
-    def read_item(self, reg_type, offset, data_type, byte_order="big"):
+    def read_item(self, reg_type, offset, data_type, byte_order="big",
+                  reg_count: int = 0):
         if not self.is_connected():
             log.error("READ  ✗ Not connected")
             raise ConnectionError("Not connected")
 
-        count = REG_COUNTS.get(data_type, 1)
+        # For ASCII, reg_count is supplied by the caller; for all others use REG_COUNTS.
+        count = reg_count if (data_type == "ASCII" and reg_count > 0) else REG_COUNTS.get(data_type, 1)
         uid = self._unit_id
         fc = REG_TYPES.get(reg_type, {}).get("fc_read", "?")
         fc_name = FC_NAMES.get(fc, f"FC{fc}")
@@ -264,7 +282,7 @@ class ModbusTcpBackend(CommunicationBackend):
         raw_regs = rr.registers
         log.info(f"READ  ✓ Raw registers: {_regs_hex(raw_regs)}  (decimal: {raw_regs})")
 
-        value = _decode_registers(raw_regs, data_type, byte_order)
+        value = _decode_registers(raw_regs, data_type, byte_order, reg_count=count)
 
         if count > 1:
             raw_bytes = _regs_to_bytes(raw_regs[:2], byte_order)

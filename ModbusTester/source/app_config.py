@@ -8,8 +8,14 @@ from pathlib import Path
 from dataclasses import dataclass, field, asdict
 
 
-# Config lives next to the script so it's easy to find
-CONFIG_DIR = Path(__file__).resolve().parent
+import sys
+
+# When frozen by PyInstaller, __file__ points inside the temp extraction dir.
+# Use the actual executable's directory so config survives across runs.
+if getattr(sys, "frozen", False):
+    CONFIG_DIR = Path(sys.executable).resolve().parent
+else:
+    CONFIG_DIR = Path(__file__).resolve().parent
 AUTO_SAVE_PATH = CONFIG_DIR / "last_session.json"
 
 
@@ -20,6 +26,7 @@ class RegisterEntry:
     offset: int = 0
     data_type: str = "UINT16"
     enabled: bool = True
+    reg_count: int = 1   # used only when data_type == "ASCII"
 
 
 @dataclass
@@ -29,7 +36,8 @@ class ConnectionConfig:
     unit_id: int = 1
     byte_order: str = "big"
     scan_interval_ms: int = 500
-
+    # "offset" = zero-based wire offset; "register" = 1-based register number
+    offset_mode: str = "register"
 
 @dataclass
 class AppConfig:
@@ -62,8 +70,20 @@ def load_config(path: str | Path | None = None) -> AppConfig:
     try:
         with open(target) as f:
             data = json.load(f)
-        conn = ConnectionConfig(**data.get("connection", {}))
-        entries = [RegisterEntry(**e) for e in data.get("entries", [])]
+
+        # Filter to only known fields so old/new JSON doesn't break dataclass init
+        import dataclasses
+        conn_fields = {f.name for f in dataclasses.fields(ConnectionConfig)}
+        entry_fields = {f.name for f in dataclasses.fields(RegisterEntry)}
+
+        conn_data = {k: v for k, v in data.get("connection", {}).items() if k in conn_fields}
+        conn = ConnectionConfig(**conn_data)
+
+        entries = []
+        for e in data.get("entries", []):
+            filtered = {k: v for k, v in e.items() if k in entry_fields}
+            entries.append(RegisterEntry(**filtered))
+
         return AppConfig(connection=conn, entries=entries)
     except (json.JSONDecodeError, TypeError, KeyError) as exc:
         print(f"[config] Failed to load {target}: {exc}")

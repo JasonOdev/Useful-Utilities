@@ -94,10 +94,14 @@ QComboBox::drop-down {{
 }}
 QComboBox::down-arrow {{
     image: none;
+    width: 0px;
+    height: 0px;
+
     border-left: 4px solid transparent;
     border-right: 4px solid transparent;
-    border-top: 5px solid {COLORS['text_dim']};
-    margin-right: 6px;
+    border-top: 4px solid {COLORS['text_dim']};
+
+    margin-top: 2px;
 }}
 QComboBox QAbstractItemView {{
     background-color: {COLORS['surface']};
